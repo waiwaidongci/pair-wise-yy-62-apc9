@@ -1,5 +1,15 @@
-import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { stowageApi, type Cargo, type CargoType } from './api';
+import { configureStore, createSlice, type Middleware, type PayloadAction } from '@reduxjs/toolkit';
+import { stowageApi, type Cargo } from './api';
+import { initialCargo } from './seed';
+import {
+  commitPatches,
+  selectActiveSnapshot,
+  selectGate,
+  snapshotActions,
+  snapshotSliceReducer
+} from './snapshot/snapshotSlice';
+import { calculateStability, detectConflicts } from './snapshot/adjudication';
+import type { CargoPatch } from './snapshot/types';
 
 export type StowageComment = {
   id: string;
@@ -21,19 +31,10 @@ type State = {
   draftSavedAt: string;
 };
 
-const initialCargo: Cargo[] = [
-  { id: 'BL-88214', bill: 'SEA-88214', type: '集装箱', bay: 12, row: 4, tier: 2, deck: '主甲板', weight: 24.6, dimension: '40 × 8 × 8.6 ft', port: '温哥华', hazmat: '无', lashing: '已绑扎', color: '#2b7c75' },
-  { id: 'BL-88219', bill: 'SEA-88219', type: '集装箱', bay: 13, row: 4, tier: 2, deck: '主甲板', weight: 28.1, dimension: '40 × 8 × 8.6 ft', port: '温哥华', hazmat: 'UN 1263', lashing: '需复核', color: '#c77835' },
-  { id: 'BL-88231', bill: 'SEA-88231', type: '集装箱', bay: 10, row: 6, tier: 1, deck: '主甲板', weight: 18.2, dimension: '20 × 8 × 8.6 ft', port: '釜山', hazmat: '无', lashing: '已绑扎', color: '#366d94' },
-  { id: 'BL-88240', bill: 'SEA-88240', type: '集装箱', bay: 8, row: 2, tier: 2, deck: '货舱', weight: 31.4, dimension: '40 × 8 × 8.6 ft', port: '温哥华', hazmat: '无', lashing: '待绑扎', color: '#6d528d' },
-  { id: 'BL-88247', bill: 'SEA-88247', type: '重大件', bay: 15, row: 0, tier: 1, deck: '主甲板', weight: 112.5, dimension: '18.4 × 4.2 × 4.8 m', port: '温哥华', hazmat: '无', lashing: '需复核', color: '#b64f49' },
-  { id: 'BL-88254', bill: 'SEA-88254', type: '散货', bay: 5, row: 0, tier: 0, deck: '货舱', weight: 286.0, dimension: '散装 / 420 m³', port: '釜山', hazmat: '无', lashing: '已绑扎', color: '#9a7836' }
-];
-
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy62-stowage-plan') : null;
-const saved = raw ? JSON.parse(raw) : null;
+const saved = raw ? JSON.parse(raw) as State : null;
 const initialState: State = saved ?? {
-  cargo: initialCargo,
+  cargo: initialCargo.map((item) => ({ ...item })),
   activeCargoId: 'BL-88247',
   planRevision: 5,
   comments: [
@@ -62,6 +63,20 @@ const slice = createSlice({
       const cargo = state.cargo.find((item) => item.id === action.payload.id);
       if (cargo) cargo.lashing = action.payload.lashing;
     },
+    /** 改卸货港（按提单号识别，影响旧港+新港结论） */
+    changePort(state, action: PayloadAction<{ id: string; port: string }>) {
+      const cargo = state.cargo.find((item) => item.id === action.payload.id);
+      if (cargo) cargo.port = action.payload.port;
+      state.planRevision += 1;
+      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    },
+    /** 快照层重算/合并/切版本后，把权威货位与版本号回灌到可编辑草稿 */
+    hydrateCargo(state, action: PayloadAction<{ cargo: Cargo[]; revision: number }>) {
+      state.cargo = action.payload.cargo.map((item) => ({ ...item }));
+      state.planRevision = action.payload.revision;
+      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    },
+    setLocked(state, action: PayloadAction<boolean>) { state.locked = action.payload; },
     addComment(state, action: PayloadAction<{ cargoId: string; author: string; role: StowageComment['role']; content: string }>) {
       state.comments.unshift({ ...action.payload, id: `CM-${Date.now()}`, status: '待确认' });
     },
@@ -77,15 +92,76 @@ const slice = createSlice({
       if (!state.acceptedLimits.includes(action.payload)) state.acceptedLimits.push(action.payload);
     },
     setViewMode(state, action: PayloadAction<'3d' | 'section'>) { state.viewMode = action.payload; },
-    lockPlan(state) { state.locked = true; state.planRevision += 1; }
+    // 锁定只改状态；版本号以权威快照为准（由 bridge 回灌，避免双份版本号分叉）
+    lockPlan(state) { state.locked = true; }
   }
 });
 
-export const { selectCargo, moveCargo, updateLashing, addComment, acceptComment, rejectComment, acceptLimit, setViewMode, lockPlan } = slice.actions;
+export const {
+  selectCargo, moveCargo, updateLashing, changePort, hydrateCargo, setLocked,
+  addComment, acceptComment, rejectComment, acceptLimit, setViewMode, lockPlan
+} = slice.actions;
+
+/**
+ * 桥接中间件：配载页的编辑经唯一入口 commitPatches 进入快照判定；
+ * 快照重算/切换/合并后的权威货位回灌配载草稿。两层状态互不直接 import 对方 reducer。
+ */
+type BridgeState = {
+  stowage: State;
+  snapshot: ReturnType<typeof snapshotSliceReducer>;
+};
+const bridge: Middleware<{}, BridgeState> = (apiStore) => (next) => (action: unknown) => {
+  const result = next(action);
+  const a = action as { type?: string; payload?: unknown };
+  if (typeof a.type !== 'string') return result;
+  const root = apiStore.getState();
+
+  // 配载页编辑 → 快照（锁定/断网时由闸门拦截）
+  if (a.type.startsWith('stowage/')) {
+    const name = a.type.slice('stowage/'.length);
+    const gate = selectGate(root);
+    if ((name === 'moveCargo' || name === 'updateLashing' || name === 'changePort') && gate.canEdit) {
+      const stowageCargo = root.stowage.cargo;
+      const patches: CargoPatch[] = [];
+      if (name === 'moveCargo') {
+        const p = a.payload as { id: string; bay: number; row: number; tier: number };
+        const target = stowageCargo.find((item: Cargo) => item.id === p.id);
+        if (target) patches.push({ bill: target.bill, bay: p.bay, row: p.row, tier: p.tier });
+      } else if (name === 'updateLashing') {
+        const p = a.payload as { id: string; lashing: Cargo['lashing'] };
+        const target = stowageCargo.find((item: Cargo) => item.id === p.id);
+        if (target) patches.push({ bill: target.bill, lashing: p.lashing });
+      } else if (name === 'changePort') {
+        const p = a.payload as { id: string; port: string };
+        const target = stowageCargo.find((item: Cargo) => item.id === p.id);
+        if (target) patches.push({ bill: target.bill, port: p.port });
+      }
+      if (patches.length) (apiStore.dispatch as (action: unknown) => unknown)(commitPatches({ patches, source: '配载工作区' }));
+    }
+    if (name === 'lockPlan' && selectGate(root).canLock) {
+      apiStore.dispatch(snapshotActions.lockFromStowage());
+    }
+  }
+
+  // 快照变更 → 回灌配载草稿（总览/对比/打印读的是同一份货位）
+  if (a.type === 'snapshot/beginPatch' || a.type === 'snapshot/beginRotation'
+    || a.type === 'snapshot/switchSnapshot' || a.type === 'snapshot/forkDraft') {
+    const active = selectActiveSnapshot(apiStore.getState() as BridgeState);
+    apiStore.dispatch(hydrateCargo({ cargo: active.cargo, revision: active.revision }));
+  }
+  if (a.type === 'snapshot/lockFromStowage') {
+    apiStore.dispatch(setLocked(true));
+  }
+  if (a.type === 'snapshot/forkDraft') {
+    apiStore.dispatch(setLocked(false));
+  }
+
+  return result;
+};
 
 export const store = configureStore({
-  reducer: { stowage: slice.reducer, [stowageApi.reducerPath]: stowageApi.reducer },
-  middleware: (getDefault) => getDefault().concat(stowageApi.middleware)
+  reducer: { stowage: slice.reducer, snapshot: snapshotSliceReducer, [stowageApi.reducerPath]: stowageApi.reducer },
+  middleware: (getDefault) => getDefault().concat(stowageApi.middleware).concat(bridge)
 });
 
 store.subscribe(() => {
@@ -93,34 +169,7 @@ store.subscribe(() => {
 });
 
 export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
 
-export function calculateStability(cargo: Cargo[]) {
-  const total = cargo.reduce((sum, item) => sum + item.weight, 0);
-  const longitudinal = cargo.reduce((sum, item) => sum + item.weight * item.bay, 0) / Math.max(total, 1);
-  const vertical = cargo.reduce((sum, item) => sum + item.weight * (item.tier + 1), 0) / Math.max(total, 1);
-  const deckLoad = cargo.filter((item) => item.deck === '主甲板').reduce((sum, item) => sum + item.weight, 0);
-  const stability = Math.max(0, 92 - Math.abs(longitudinal - 10.8) * 2.2 - Math.max(0, vertical - 1.75) * 8);
-  return {
-    total,
-    longitudinal,
-    vertical,
-    deckLoad,
-    stability,
-    trim: (longitudinal - 10.8) < -0.4 ? '艉倾' : (longitudinal - 10.8) > 0.4 ? '艏倾' : '正平'
-  };
-}
-
-export function detectConflicts(cargo: Cargo[]) {
-  const issues: { id: string; cargoId: string; level: 'high' | 'medium'; title: string; detail: string }[] = [];
-  const slots = new Map<string, Cargo>();
-  cargo.forEach((item) => {
-    const key = `${item.deck}-${item.bay}-${item.row}-${item.tier}`;
-    const existing = slots.get(key);
-    if (existing) issues.push({ id: `${item.id}-overlap`, cargoId: item.id, level: 'high', title: '货位重叠', detail: `${item.id} 与 ${existing.id} 占用相同二维货位。` });
-    slots.set(key, item);
-    if (item.hazmat !== '无' && item.deck === '主甲板' && item.row <= 1) issues.push({ id: `${item.id}-hazmat`, cargoId: item.id, level: 'high', title: '危险品隔离不足', detail: `${item.id} 与船体边界距离小于方案要求。` });
-    if (item.weight > 100 && item.lashing !== '已绑扎') issues.push({ id: `${item.id}-lashing`, cargoId: item.id, level: 'medium', title: '重大件绑扎未完成', detail: `${item.id} 重量 ${item.weight}t，绑扎状态为“${item.lashing}”。` });
-    if (item.type === '集装箱' && item.weight > 30 && item.tier >= 3) issues.push({ id: `${item.id}-stack`, cargoId: item.id, level: 'medium', title: '上层堆重超限', detail: `${item.id} 不应放在第 ${item.tier} 层。` });
-  });
-  return issues;
-}
+// 原有页面继续从 store 引用全船校核函数（实现归快照判定模块）
+export { calculateStability, detectConflicts };

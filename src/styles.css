@@ -137,3 +137,31 @@ body { margin: 0; min-width: 320px; background: #eef2f0; }
   .page { padding: 0; max-width: none; }
   .print-sheet { border: 0; padding: 0 !important; }
 }
+
+/* ---------- 配载快照页 ---------- */
+.snap-section { border: 1px solid var(--line); box-shadow: none !important; overflow: hidden; }
+.gate-card { border: 1px solid #b9d9d0; background: #f3faf7; }
+.gate-card.blocked { border-color: #e3b27c; background: #fffaf2; }
+.snapshot-chip { cursor: pointer; text-transform: none; font-weight: 600; }
+.port-card { background: #fbfdfc; }
+.port-table td { border: 0; padding: 3px 4px; font-size: 11px; vertical-align: top; }
+.port-table td:first-child { color: var(--muted); width: 64px; white-space: nowrap; }
+.port-table code { font-size: 9px; }
+.batch-table .mantine-Code-root { font-size: 9px; }
+.spin { animation: snap-spin 1.1s linear infinite; }
+@keyframes snap-spin { to { transform: rotate(360deg); } }
+.conflict-pick { background: #fffdf8; border-color: #e7cf9f; }
+.pick-card { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; text-align: left; border: 1px dashed #c9b78d; background: white; border-radius: 5px; padding: 9px; cursor: pointer; color: inherit; }
+.pick-card:hover:not(:disabled) { border-color: #1f7063; background: #f1f8f5; }
+.pick-card:disabled { cursor: default; opacity: .82; }
+.pick-card strong { font-size: 11px; }
+.pick-card small { color: var(--muted); font-size: 9px; }
+.pick-card.locked { border-color: #24776a; background: #f0f8f5; }
+.snap-log { max-height: 230px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+.snap-log > div { display: flex; gap: 9px; font-size: 10px; line-height: 1.5; padding: 5px 7px; border-radius: 4px; background: #f6f9f8; }
+.snap-log small { color: #93a59e; white-space: nowrap; font-size: 9px; }
+.snap-log .log-ok { background: #eef8f3; }
+.snap-log .log-warn { background: #fdf4e6; }
+.snap-log .log-warn span { color: #8e5617; }
+.app-nav > a { flex: 0 0 auto; }
+
