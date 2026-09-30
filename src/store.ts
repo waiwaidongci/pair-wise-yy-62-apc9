@@ -1,5 +1,22 @@
-import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
+import { configureStore, createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { stowageApi, type Cargo, type CargoType } from './api';
+import {
+  canLockOrPrint,
+  createInitialSnapshot,
+  determineAffectedPorts,
+  hasPendingConclusion,
+  isSnapshotCurrent,
+  markPortsRecalculating,
+  recalculatePorts,
+  type Snapshot
+} from './snapshot';
+import {
+  createSaveBatch,
+  importManifest,
+  saveBatchRequest,
+  type SaveBatch
+} from './requestEntry';
+import { mergeOfflineChanges, resolveConflict, type ConflictPair, type OfflineChange } from './offlineMerge';
 
 export type StowageComment = {
   id: string;
@@ -19,6 +36,15 @@ type State = {
   locked: boolean;
   viewMode: '3d' | 'section';
   draftSavedAt: string;
+  /** 配载快照：货位、卸货港、绑扎复核共同绑定的同一份快照 */
+  snapshot: Snapshot;
+  /** 保存批次：失败后保留待重试 */
+  pendingSaveBatch: SaveBatch | null;
+  saveStatus: 'idle' | 'saving' | 'failed' | 'saved';
+  /** 最近一次导入结果（重复提单号沿用第一次） */
+  lastImport: { duplicates: string[]; added: string[] } | null;
+  /** 断网恢复后的待选冲突（货位不同的两份） */
+  offlineConflicts: ConflictPair[];
 };
 
 const initialCargo: Cargo[] = [
@@ -30,37 +56,187 @@ const initialCargo: Cargo[] = [
   { id: 'BL-88254', bill: 'SEA-88254', type: '散货', bay: 5, row: 0, tier: 0, deck: '货舱', weight: 286.0, dimension: '散装 / 420 m³', port: '釜山', hazmat: '无', lashing: '已绑扎', color: '#9a7836' }
 ];
 
+const initialSnapshot = createInitialSnapshot(initialCargo, 5);
+
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy62-stowage-plan') : null;
 const saved = raw ? JSON.parse(raw) : null;
-const initialState: State = saved ?? {
-  cargo: initialCargo,
-  activeCargoId: 'BL-88247',
-  planRevision: 5,
-  comments: [
-    { id: 'CM-21', cargoId: 'BL-88219', author: '港方配载', role: '码头', content: '危险品箱与船员生活区保持隔离，请在最终图中标注危险品隔离线。', status: '待确认' },
-    { id: 'CM-22', cargoId: 'BL-88247', author: '周船长', role: '船长', content: '重大件横向支撑需增加两组绑扎点，检查甲板局部强度。', status: '待确认' },
-    { id: 'CM-23', cargoId: 'BL-88254', author: '货主代表', role: '货主', content: '釜山港卸货前不得覆盖散货舱口，已接受当前安排。', status: '已接受' }
-  ],
-  acceptedLimits: [],
-  locked: false,
-  viewMode: '3d',
-  draftSavedAt: '09:52'
-};
+const initialState: State = saved
+  ? {
+      ...saved,
+      // 快照不持久化旧结论，首次加载按当前货票重建，保证货位/卸货港/绑扎同源
+      snapshot: createInitialSnapshot(saved.cargo ?? initialCargo, saved.planRevision ?? 5),
+      pendingSaveBatch: null,
+      saveStatus: 'idle',
+      lastImport: null,
+      offlineConflicts: []
+    }
+  : {
+      cargo: initialCargo,
+      activeCargoId: 'BL-88247',
+      planRevision: 5,
+      comments: [
+        { id: 'CM-21', cargoId: 'BL-88219', author: '港方配载', role: '码头', content: '危险品箱与船员生活区保持隔离，请在最终图中标注危险品隔离线。', status: '待确认' },
+        { id: 'CM-22', cargoId: 'BL-88247', author: '周船长', role: '船长', content: '重大件横向支撑需增加两组绑扎点，检查甲板局部强度。', status: '待确认' },
+        { id: 'CM-23', cargoId: 'BL-88254', author: '货主代表', role: '货主', content: '釜山港卸货前不得覆盖散货舱口，已接受当前安排。', status: '已接受' }
+      ],
+      acceptedLimits: [],
+      locked: false,
+      viewMode: '3d',
+      draftSavedAt: '09:52',
+      snapshot: initialSnapshot,
+      pendingSaveBatch: null,
+      saveStatus: 'idle',
+      lastImport: null,
+      offlineConflicts: []
+    };
+
+/** 重算受影响港口的结论（异步，模拟计算耗时）。 */
+export const recalculateAffectedPorts = createAsyncThunk<void, string[], { state: RootState }>(
+  'stowage/recalculateAffectedPorts',
+  async (ports, { getState, dispatch }) => {
+    if (!ports.length) return;
+    dispatch(portsRecalculating(ports));
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    const { cargo, snapshot } = getState().stowage;
+    const next = recalculatePorts(snapshot, ports, cargo);
+    dispatch(portsRecalculated(next));
+  }
+);
+
+/** 保存当前配载为一个批次；失败则原批次保留待重试。 */
+export const saveCurrentBatch = createAsyncThunk<void, void, { state: RootState }>(
+  'stowage/saveCurrentBatch',
+  async (_void, { getState, dispatch }) => {
+    const batch = createSaveBatch(getState().stowage.cargo);
+    dispatch(saveStarted(batch));
+    const result = await saveBatchRequest(batch);
+    if (result.ok) dispatch(saveSucceeded());
+    else dispatch(saveFailed(result.error ?? '保存失败'));
+  }
+);
+
+/** 重试上次失败的保存批次。 */
+export const retrySave = createAsyncThunk<void, void, { state: RootState }>(
+  'stowage/retrySave',
+  async (_void, { getState, dispatch }) => {
+    const batch = getState().stowage.pendingSaveBatch;
+    if (!batch) return;
+    dispatch(saveStarted({ ...batch, attempts: batch.attempts + 1, status: 'saving', lastError: null }));
+    const result = await saveBatchRequest({ ...batch, attempts: batch.attempts + 1 });
+    if (result.ok) dispatch(saveSucceeded());
+    else dispatch(saveFailed(result.error ?? '保存失败'));
+  }
+);
+
+/** 导入舱单：按提单号去重（重复沿用第一次），随后保存为一个批次。 */
+export const importCargoAndSave = createAsyncThunk<void, Cargo[], { state: RootState }>(
+  'stowage/importCargoAndSave',
+  async (incoming, { getState, dispatch }) => {
+    const prev = getState().stowage.cargo;
+    const result = importManifest(prev, incoming);
+    const affected = determineAffectedPorts(prev, result.imported);
+    dispatch(importRecorded({ cargo: result.imported, duplicates: result.duplicates, added: result.added }));
+    if (affected.length) dispatch(recalculateAffectedPorts(affected));
+    // 导入后保存为一个批次（失败则保留待重试）
+    const batch = createSaveBatch(result.imported);
+    dispatch(saveStarted(batch));
+    const saveResult = await saveBatchRequest(batch);
+    if (saveResult.ok) dispatch(saveSucceeded());
+    else dispatch(saveFailed(saveResult.error ?? '保存失败'));
+  }
+);
+
+/** 断网恢复：合并两个终端的离线修改，货位不同则保留两份待选。 */
+export const mergeOffline = createAsyncThunk<void, { changesA: OfflineChange[]; changesB: OfflineChange[] }, { state: RootState }>(
+  'stowage/mergeOffline',
+  async ({ changesA, changesB }, { getState, dispatch }) => {
+    const base = getState().stowage.cargo;
+    const result = mergeOfflineChanges(base, changesA, changesB);
+    const affected = determineAffectedPorts(base, result.merged);
+    dispatch(offlineMergeRecorded({ cargo: result.merged, conflicts: result.conflicts }));
+    if (affected.length) dispatch(recalculateAffectedPorts(affected));
+  }
+);
 
 const slice = createSlice({
   name: 'stowage',
-  initialState,
+  initialState: initialState as State,
   reducers: {
     selectCargo(state, action: PayloadAction<string>) { state.activeCargoId = action.payload; },
-    moveCargo(state, action: PayloadAction<{ id: string; bay: number; row: number; tier: number }>) {
-      const cargo = state.cargo.find((item) => item.id === action.payload.id);
-      if (cargo) Object.assign(cargo, action.payload);
-      state.planRevision += 1;
+    /** 货票变化：更新工作副本，标记受影响港口结论为过期（重算中的不降级）。 */
+    cargoMutated(state, action: PayloadAction<{ cargo: Cargo[]; affected: string[] }>) {
+      state.cargo = action.payload.cargo;
+      const conclusions = { ...state.snapshot.conclusions };
+      action.payload.affected.forEach((port) => {
+        const existing = conclusions[port];
+        if (existing && existing.status === 'recalculating') return; // 重算中的等最新货票
+        conclusions[port] = {
+          port,
+          status: 'stale',
+          dischargeSequence: existing?.dischargeSequence ?? [],
+          dgConflicts: existing?.dgConflicts ?? [],
+          stability: existing?.stability ?? { weight: 0, moment: 0, margin: 0 },
+          lashingReview: existing?.lashingReview ?? [],
+          computedAt: existing?.computedAt ?? new Date().toISOString()
+        };
+      });
+      state.snapshot = { ...state.snapshot, conclusions };
       state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
     },
-    updateLashing(state, action: PayloadAction<{ id: string; lashing: Cargo['lashing'] }>) {
-      const cargo = state.cargo.find((item) => item.id === action.payload.id);
-      if (cargo) cargo.lashing = action.payload.lashing;
+    portsRecalculating(state, action: PayloadAction<string[]>) {
+      state.snapshot = markPortsRecalculating(state.snapshot, action.payload);
+    },
+    portsRecalculated(state, action: PayloadAction<Snapshot>) {
+      state.snapshot = action.payload;
+      state.planRevision = action.payload.revision;
+      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    },
+    saveStarted(state, action: PayloadAction<SaveBatch>) {
+      state.pendingSaveBatch = action.payload;
+      state.saveStatus = 'saving';
+    },
+    saveSucceeded(state) {
+      if (state.pendingSaveBatch) {
+        state.pendingSaveBatch = { ...state.pendingSaveBatch, status: 'saved', attempts: state.pendingSaveBatch.attempts + 1, lastError: null };
+      }
+      state.saveStatus = 'saved';
+    },
+    saveFailed(state, action: PayloadAction<string>) {
+      if (state.pendingSaveBatch) {
+        state.pendingSaveBatch = { ...state.pendingSaveBatch, status: 'failed', attempts: state.pendingSaveBatch.attempts + 1, lastError: action.payload };
+      }
+      state.saveStatus = 'failed';
+    },
+    importRecorded(state, action: PayloadAction<{ cargo: Cargo[]; duplicates: string[]; added: string[] }>) {
+      state.cargo = action.payload.cargo;
+      state.lastImport = { duplicates: action.payload.duplicates, added: action.payload.added };
+      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    },
+    offlineMergeRecorded(state, action: PayloadAction<{ cargo: Cargo[]; conflicts: ConflictPair[] }>) {
+      state.cargo = action.payload.cargo;
+      state.offlineConflicts = action.payload.conflicts;
+      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    },
+    offlineConflictResolved(state, action: PayloadAction<{ bill: string; pick: 'first' | 'second' }>) {
+      const conflict = state.offlineConflicts.find((item) => item.bill === action.payload.bill);
+      if (!conflict) return;
+      state.cargo = resolveConflict(state.cargo, conflict, action.payload.pick);
+      state.offlineConflicts = state.offlineConflicts.filter((item) => item.bill !== action.payload.bill);
+      const affected = determineAffectedPorts(state.snapshot.cargo, state.cargo);
+      const conclusions = { ...state.snapshot.conclusions };
+      affected.forEach((port) => {
+        const existing = conclusions[port];
+        conclusions[port] = {
+          port,
+          status: 'stale',
+          dischargeSequence: existing?.dischargeSequence ?? [],
+          dgConflicts: existing?.dgConflicts ?? [],
+          stability: existing?.stability ?? { weight: 0, moment: 0, margin: 0 },
+          lashingReview: existing?.lashingReview ?? [],
+          computedAt: existing?.computedAt ?? new Date().toISOString()
+        };
+      });
+      state.snapshot = { ...state.snapshot, conclusions };
     },
     addComment(state, action: PayloadAction<{ cargoId: string; author: string; role: StowageComment['role']; content: string }>) {
       state.comments.unshift({ ...action.payload, id: `CM-${Date.now()}`, status: '待确认' });
@@ -77,11 +253,63 @@ const slice = createSlice({
       if (!state.acceptedLimits.includes(action.payload)) state.acceptedLimits.push(action.payload);
     },
     setViewMode(state, action: PayloadAction<'3d' | 'section'>) { state.viewMode = action.payload; },
-    lockPlan(state) { state.locked = true; state.planRevision += 1; }
+    lockPlan(state) {
+      // 重算未完成前不能锁定；快照锁定后不允许再放行旧图
+      if (!canLockOrPrint(state.snapshot)) return;
+      state.snapshot = { ...state.snapshot, locked: true };
+      state.locked = true;
+      state.planRevision += 1;
+    }
   }
 });
 
-export const { selectCargo, moveCargo, updateLashing, addComment, acceptComment, rejectComment, acceptLimit, setViewMode, lockPlan } = slice.actions;
+export const {
+  selectCargo,
+  cargoMutated,
+  portsRecalculating,
+  portsRecalculated,
+  saveStarted,
+  saveSucceeded,
+  saveFailed,
+  importRecorded,
+  offlineMergeRecorded,
+  offlineConflictResolved,
+  addComment,
+  acceptComment,
+  rejectComment,
+  acceptLimit,
+  setViewMode,
+  lockPlan
+} = slice.actions;
+
+/** 货票变化的统一入口：更新工作副本 → 判定受影响港口 → 触发增量重算。 */
+function mutateCargo(getState: () => RootState, dispatch: AppDispatch, next: Cargo[]) {
+  const prev = getState().stowage.cargo;
+  const affected = determineAffectedPorts(prev, next);
+  dispatch(cargoMutated({ cargo: next, affected }));
+  if (affected.length) dispatch(recalculateAffectedPorts(affected));
+}
+
+export function moveCargo(id: string, bay: number, row: number, tier: number) {
+  return (dispatch: AppDispatch, getState: () => RootState) => {
+    const next = getState().stowage.cargo.map((item) => (item.id === id ? { ...item, bay, row, tier } : item));
+    mutateCargo(getState, dispatch, next);
+  };
+}
+
+export function updatePort(id: string, port: string) {
+  return (dispatch: AppDispatch, getState: () => RootState) => {
+    const next = getState().stowage.cargo.map((item) => (item.id === id ? { ...item, port } : item));
+    mutateCargo(getState, dispatch, next);
+  };
+}
+
+export function updateLashing(id: string, lashing: Cargo['lashing']) {
+  return (dispatch: AppDispatch, getState: () => RootState) => {
+    const next = getState().stowage.cargo.map((item) => (item.id === id ? { ...item, lashing } : item));
+    mutateCargo(getState, dispatch, next);
+  };
+}
 
 export const store = configureStore({
   reducer: { stowage: slice.reducer, [stowageApi.reducerPath]: stowageApi.reducer },
@@ -89,10 +317,28 @@ export const store = configureStore({
 });
 
 store.subscribe(() => {
-  if (typeof localStorage !== 'undefined') localStorage.setItem('yy62-stowage-plan', JSON.stringify(store.getState().stowage));
+  if (typeof localStorage !== 'undefined') {
+    const state = store.getState().stowage;
+    // 持久化时剔除易失的快照结论与批次，避免旧结论覆盖新快照
+    const { snapshot, pendingSaveBatch, ...persist } = state;
+    void snapshot;
+    void pendingSaveBatch;
+    localStorage.setItem('yy62-stowage-plan', JSON.stringify(persist));
+  }
 });
 
 export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+
+/** 快照是否仍为最新（货票与快照一致）。 */
+export function snapshotIsCurrent(state: State): boolean {
+  return isSnapshotCurrent(state.snapshot, state.cargo);
+}
+
+/** 是否存在未完成的港口结论（重算中 / 过期）。 */
+export function snapshotPending(state: State): boolean {
+  return hasPendingConclusion(state.snapshot);
+}
 
 export function calculateStability(cargo: Cargo[]) {
   const total = cargo.reduce((sum, item) => sum + item.weight, 0);

@@ -111,6 +111,25 @@ body { margin: 0; min-width: 320px; background: #eef2f0; }
 .print-deck b { position: absolute; right: 5px; bottom: 5px; background: #c26b2a; color: white; border-radius: 3px; font-size: 8px; padding: 2px 4px; }
 .print-signatures { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-top: 35px; padding-top: 17px; border-top: 1px solid var(--line); font-size: 11px; }
 
+/* 全局同步条：保存失败待重试 / 断网冲突 / 导入去重 */
+.sync-banner { display: flex; flex-direction: column; gap: 6px; padding: 10px 26px 0; }
+.sync-item { display: flex; align-items: center; gap: 9px; border: 1px solid; border-radius: 6px; padding: 9px 12px; font-size: 12px; }
+.sync-item span { flex: 1; color: #5b6f68; }
+.sync-item strong { color: #17332c; margin-right: 6px; }
+.sync-fail { background: #fdf1ef; border-color: #e6b8b3; color: #b64440; }
+.sync-fail strong { color: #8f2f2b; }
+.sync-ok { background: #eef7f4; border-color: #b9d9d0; color: #236f62; }
+.sync-conflict { background: #fff7e7; border-color: #ebcf9f; color: #aa671e; }
+.sync-conflict strong { color: #8a5a17; }
+.sync-dup { background: #f4f6f5; border-color: #d8e0dd; color: #5b6f68; }
+.recalc-banner { background: #eef4f8; border-color: #b9cfe0; color: #2b5a7a; }
+.recalc-banner span { color: #5b7182; }
+
+/* 分港结论面板 */
+.port-row { border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; }
+.port-head { display: flex; align-items: center; justify-content: space-between; }
+.port-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 5px; font-size: 9px; color: var(--muted); }
+
 @media (max-width: 1200px) {
   .stowage-grid { grid-template-columns: 260px minmax(460px, 1fr); }
   .stowage-grid > :last-child { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }

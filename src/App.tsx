@@ -56,15 +56,25 @@ import {
   addComment,
   calculateStability,
   detectConflicts,
+  importCargoAndSave,
   lockPlan,
+  mergeOffline,
   moveCargo,
+  offlineConflictResolved,
+  recalculateAffectedPorts,
   rejectComment,
+  retrySave,
+  saveCurrentBatch,
   selectCargo,
   setViewMode,
   store,
   updateLashing,
+  updatePort,
+  type AppDispatch,
   type RootState
 } from './store';
+import { canLockOrPrint, hasPendingConclusion } from './snapshot';
+import type { OfflineChange } from './offlineMerge';
 
 const nav = [
   { path: '/', label: '航次总览', icon: <IconShip size={17} /> },
@@ -72,6 +82,26 @@ const nav = [
   { path: '/compare', label: '方案对比', icon: <IconHistory size={17} /> },
   { path: '/print', label: '配载图与清单', icon: <IconPrinter size={17} /> }
 ];
+
+/** 全局同步条：保存失败待重试、断网恢复待选冲突、导入重复提示。 */
+function SyncBanner() {
+  const pendingSave = useSelector((root: RootState) => root.stowage.pendingSaveBatch);
+  const saveStatus = useSelector((root: RootState) => root.stowage.saveStatus);
+  const conflicts = useSelector((root: RootState) => root.stowage.offlineConflicts);
+  const lastImport = useSelector((root: RootState) => root.stowage.lastImport);
+  const dispatch = useDispatch<AppDispatch>();
+  if (!pendingSave && !conflicts.length && !lastImport) return null;
+  const handlePick = (bill: string, pick: 'first' | 'second') => dispatch(offlineConflictResolved({ bill, pick }));
+  return (
+    <div className="sync-banner">
+    {pendingSave?.status === 'failed' && <div className="sync-item sync-fail"><IconAlertTriangle size={15} /><span><strong>保存失败，原批次待重试</strong>{pendingSave.lastError}（批次 {pendingSave.id}，已试 {pendingSave.attempts} 次）</span><Button size="compact-xs" color="teal" loading={saveStatus === 'saving'} onClick={() => dispatch(retrySave())}>重试保存</Button></div>}
+    {pendingSave?.status === 'saving' && <div className="sync-item"><IconRefresh size={15} /><span>正在保存批次 {pendingSave.id}…</span></div>}
+    {pendingSave?.status === 'saved' && saveStatus === 'saved' && <div className="sync-item sync-ok"><IconCheck size={15} /><span>批次 {pendingSave.id} 已保存。</span></div>}
+    {conflicts.map((conflict) => <div className="sync-item sync-conflict" key={conflict.bill}><IconHistory size={15} /><span><strong>断网修改冲突 · {conflict.bill}</strong> 两个终端货位不同，已保留两份待选，未覆盖锁定版本。</span><Group gap={4}><Button size="compact-xs" variant="default" onClick={() => dispatch(offlineConflictResolved({ bill: conflict.bill, pick: 'first' }))}>选 A 方案</Button><Button size="compact-xs" color="teal" onClick={() => dispatch(offlineConflictResolved({ bill: conflict.bill, pick: 'second' }))}>选 B 方案</Button></Group></div>)}
+    {lastImport && lastImport.duplicates.length > 0 && <div className="sync-item sync-dup"><IconFileDescription size={15} /><span><strong>导入去重</strong> {lastImport.duplicates.length} 个提单号重复沿用第一次结果：{lastImport.duplicates.join('、')}{lastImport.added.length > 0 ? `；新增 ${lastImport.added.length} 票。` : ''}</span></div>}
+    </div>
+  );
+}
 
 function PageHeading({ eyebrow, title, description, actions }: { eyebrow: string; title: string; description: string; actions?: ReactNode }) {
   return <div className="page-heading"><div><small>{eyebrow}</small><h1>{title}</h1><p>{description}</p></div><Group gap="xs">{actions}</Group></div>;
@@ -82,7 +112,7 @@ function ThreeHold({ compact = false }: { compact?: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cargo = useSelector((root: RootState) => root.stowage.cargo);
   const activeId = useSelector((root: RootState) => root.stowage.activeCargoId);
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   const [rotation, setRotation] = useState({ theta: .65, phi: 1.05 });
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -213,19 +243,20 @@ function ThreeHold({ compact = false }: { compact?: boolean }) {
 
 function SectionView() {
   const cargo = useSelector((root: RootState) => root.stowage.cargo);
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   return <div className="section-view"><div className="section-labels"><span>第 3 层</span><span>第 2 层</span><span>第 1 层</span><span>舱底</span></div><div className="section-grid">{Array.from({ length: 9 * 4 }).map((_, index) => { const tier = 4 - Math.floor(index / 9); const row = index % 9; const item = cargo.find((cargoItem) => cargoItem.tier === tier && cargoItem.row === row); return <button key={index} className={item ? 'occupied' : ''} style={item ? { background: item.color } : undefined} onClick={() => item && dispatch(selectCargo(item.id))} title={item ? `${item.id} · ${item.weight}t` : `空货位 R${row} T${tier}`}>{item?.bill.slice(-3)}</button>; })}</div><div className="section-axis">舱内横向剖面 · 鼠标悬停查看重量</div></div>;
 }
 
 function Overview() {
   const state = useSelector((root: RootState) => root.stowage);
   const { data } = useGetVoyageQuery();
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   const stability = calculateStability(state.cargo);
   const conflicts = detectConflicts(state.cargo);
   const active = state.cargo.find((item) => item.id === state.activeCargoId) ?? state.cargo[0];
   return <div className="page">
-    <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || state.locked} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : '锁定配载版本'}</Button></>} />
+    <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || !canLockOrPrint(state.snapshot)} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : hasPendingConclusion(state.snapshot) ? '重算中，暂不可锁定' : '锁定配载版本'}</Button></>} />
+    {hasPendingConclusion(state.snapshot) && <div className="warning-banner recalc-banner"><IconRefresh size={18} /><strong>受影响港口结论重算中</strong><span>卸货顺序、危险品隔离、稳性裕度与绑扎复核完成前，锁定与打印暂不可用；其他港口原有结论继续有效。</span></div>}
     {conflicts.length > 0 && <div className="warning-banner"><IconAlertTriangle size={18} /><strong>{conflicts.length} 项配载冲突待处理</strong><span>{conflicts.map((item) => item.title).join('、')}</span></div>}
     <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="sm" mb="md">{[
       ['总货重', `${stability.total.toFixed(1)} t`, '设计上限 3560 t', 'ok'],
@@ -244,9 +275,25 @@ function Overview() {
   </div>;
 }
 
+/** 港口结论面板：每个港口的卸货顺序、危险品隔离、稳性裕度、绑扎复核结论状态。 */
+function PortConclusionPanel() {
+  const snapshot = useSelector((root: RootState) => root.stowage.snapshot);
+  const dispatch = useDispatch<AppDispatch>();
+  const statusMeta = {
+    valid: { label: '有效', color: 'teal' },
+    stale: { label: '待重算', color: 'orange' },
+    recalculating: { label: '重算中', color: 'blue' }
+  } as const;
+  return <Card padding="md"><div className="panel-title"><div><strong>分港结论</strong><Text size="xs" c="dimmed">仅受影响港口重算，其他港原结论继续有效</Text></div><Badge color="gray" variant="light">快照 V{snapshot.revision}</Badge></div><Stack gap={6} mt="sm">{snapshot.ports.map((port) => {
+    const conclusion = snapshot.conclusions[port];
+    const meta = conclusion ? statusMeta[conclusion.status] : statusMeta.stale;
+    return <div className="port-row" key={port}><div className="port-head"><Text size="xs" fw={700}>{port}</Text><Group gap={4}><Badge size="xs" color={meta.color}>{meta.label}</Badge>{conclusion?.status === 'stale' && <Button size="compact-xs" variant="subtle" onClick={() => dispatch(recalculateAffectedPorts([port]))}>重算</Button>}</Group></div>{conclusion && <div className="port-meta"><span>卸货 {conclusion.dischargeSequence.length} 票</span><span>隔离 {conclusion.dgConflicts.length} 项</span><span>稳性 {conclusion.stability.margin.toFixed(1)}</span><span>绑扎复核 {conclusion.lashingReview.filter((item) => item.required).length} 票</span></div>}</div>;
+  })}</Stack></Card>;
+}
+
 function Stowage() {
   const state = useSelector((root: RootState) => root.stowage);
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   const active = state.cargo.find((item) => item.id === state.activeCargoId) ?? state.cargo[0];
   const conflicts = detectConflicts(state.cargo);
   const stability = calculateStability(state.cargo);
@@ -260,10 +307,11 @@ function Stowage() {
   return <div className="page">
     <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge>} />
     <div className="stowage-grid">
-      <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></button>)}</div></ScrollArea></Card>
-      <Card padding={0} className="deck-panel"><div className="panel-title"><div><strong>主甲板货位图</strong><Text size="xs" c="dimmed">将货物拖入槽位，或点击槽位选择</Text></div><Group gap="xs"><Badge color="teal">稳性 {stability.stability.toFixed(1)}%</Badge><Badge color="gray">{stability.trim}</Badge></Group></div><div className="deck-layout"><div className="bridge-shape">驾驶台</div><div className="slot-grid">{slots.map((slot) => { const occupied = state.cargo.find((item) => item.deck === '主甲板' && item.bay === slot.bay && item.row === slot.row); return <button key={slot.id} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragId) dispatch(moveCargo({ id: dragId, bay: slot.bay, row: slot.row, tier: occupied?.tier ?? 1 })); setDragId(null); }} className={occupied ? 'occupied' : ''} style={occupied ? { background: occupied.color } : undefined} onClick={() => { if (occupied) { dispatch(selectCargo(occupied.id)); setRow(slot.row); setBay(slot.bay); } }}><small>{slot.label}</small>{occupied && <strong>{occupied.bill.slice(-3)}<span>{occupied.weight}t</span></strong>}</button>; })}</div><div className="deck-axis">左舷 ← 横向 Row → 右舷</div></div></Card>
+      <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><Group gap={4} px="md" pb="xs"><Button size="compact-xs" variant="default" leftSection={<IconCheck size={12} />} onClick={() => dispatch(saveCurrentBatch())}>保存批次</Button><Button size="compact-xs" variant="default" leftSection={<IconFileDescription size={12} />} onClick={() => dispatch(importCargoAndSave([{ id: 'BL-88219', bill: 'SEA-88219', type: '集装箱', bay: 13, row: 4, tier: 2, deck: '主甲板', weight: 28.1, dimension: '40 × 8 × 8.6 ft', port: '温哥华', hazmat: 'UN 1263', lashing: '需复核', color: '#c77835' }, { id: 'BL-88260', bill: 'SEA-88260', type: '集装箱', bay: 7, row: 3, tier: 2, deck: '主甲板', weight: 22.0, dimension: '20 × 8 × 8.6 ft', port: '釜山', hazmat: '无', lashing: '已绑扎', color: '#3a7d6e' }]))}>导入舱单</Button><Button size="compact-xs" variant="default" leftSection={<IconHistory size={12} />} onClick={() => { const a: OfflineChange[] = [{ bill: 'SEA-88231', bay: 11, row: 2, tier: 1, deck: '主甲板', port: '釜山', lashing: '已绑扎', terminal: 'A' }]; const b: OfflineChange[] = [{ bill: 'SEA-88231', bay: 9, row: 5, tier: 1, deck: '主甲板', port: '釜山', lashing: '已绑扎', terminal: 'B' }]; dispatch(mergeOffline({ changesA: a, changesB: b })); }}>断网恢复合并</Button></Group><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></button>)}</div></ScrollArea></Card>
+      <Card padding={0} className="deck-panel"><div className="panel-title"><div><strong>主甲板货位图</strong><Text size="xs" c="dimmed">将货物拖入槽位，或点击槽位选择</Text></div><Group gap="xs"><Badge color="teal">稳性 {stability.stability.toFixed(1)}%</Badge><Badge color="gray">{stability.trim}</Badge></Group></div><div className="deck-layout"><div className="bridge-shape">驾驶台</div><div className="slot-grid">{slots.map((slot) => { const occupied = state.cargo.find((item) => item.deck === '主甲板' && item.bay === slot.bay && item.row === slot.row); return <button key={slot.id} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragId) dispatch(moveCargo(dragId, slot.bay, slot.row, occupied?.tier ?? 1)); setDragId(null); }} className={occupied ? 'occupied' : ''} style={occupied ? { background: occupied.color } : undefined} onClick={() => { if (occupied) { dispatch(selectCargo(occupied.id)); setRow(slot.row); setBay(slot.bay); } }}><small>{slot.label}</small>{occupied && <strong>{occupied.bill.slice(-3)}<span>{occupied.weight}t</span></strong>}</button>; })}</div><div className="deck-axis">左舷 ← 横向 Row → 右舷</div></div></Card>
       <Stack gap="sm">
-        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo({ id: active.id, bay, row, tier }))}>应用货位调整</Button><Divider /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing({ id: active.id, lashing: value as Cargo['lashing'] }))} /></Stack></Card>
+        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo(active.id, bay, row, tier))}>应用货位调整</Button><Divider /><Select label="卸货港" data={['上海', '釜山', '温哥华']} value={active.port} onChange={(value) => value && dispatch(updatePort(active.id, value))} /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing(active.id, value as Cargo['lashing']))} /></Stack></Card>
+        <PortConclusionPanel />
         <Card padding="md" className={conflicts.length ? 'conflict-card' : ''}><div className="panel-title"><div><strong>实时冲突</strong><Text size="xs" c="dimmed">重心、稳性、隔离与堆码</Text></div><IconAlertTriangle size={18} /></div>{conflicts.map((item) => <button className="conflict-row" key={item.id} onClick={() => dispatch(selectCargo(item.cargoId))}><Badge size="xs" color={item.level === 'high' ? 'red' : 'orange'}>{item.level === 'high' ? '阻断' : '预警'}</Badge><div><strong>{item.title}</strong><span>{item.detail}</span></div></button>)}{!conflicts.length && <Text size="sm" c="teal" mt="md">当前方案未发现冲突。</Text>}</Card>
       </Stack>
     </div>
@@ -276,7 +324,7 @@ function Compare() {
   const stability = calculateStability(state.cargo);
   const changed = state.cargo.filter((item) => item.id === 'BL-88247' || item.id === 'BL-88219' || item.id === 'BL-88240');
   const [acceptOpen, setAcceptOpen] = useState(false);
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   return <div className="page">
     <PageHeading eyebrow="PLAN BASELINE / V4 → V5" title="配载方案对比" description="按货位、重量分布和受限条件比较两个版本，并逐项决定是否接受。" actions={<Button color="teal" leftSection={<IconCheck size={16} />} onClick={() => setAcceptOpen(true)}>形成审阅结论</Button>} />
     <div className="compare-summary"><div><span>当前版本</span><strong>V{state.planRevision}</strong><small>总重 {stability.total.toFixed(1)}t</small></div><span className="compare-arrow">→</span><div><span>被比较版本</span><strong>V4</strong><small>总重 {(stability.total + 5.2).toFixed(1)}t</small></div><Badge color="teal" variant="light">3 处货位变化</Badge></div>
@@ -294,11 +342,12 @@ function PrintPlan() {
   const { data } = useGetVoyageQuery();
   const state = useSelector((root: RootState) => root.stowage);
   const stability = calculateStability(state.cargo);
-  const dispatch = useDispatch();
+  const dispatch = useDispatch<AppDispatch>();
   return <div className="page print-page">
-    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} onClick={() => window.print()}>打印配载包</Button></>} />
+    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} disabled={!canLockOrPrint(state.snapshot)} onClick={() => window.print()}>{hasPendingConclusion(state.snapshot) ? '重算中，暂不可打印' : '打印配载包'}</Button></>} />
+    {hasPendingConclusion(state.snapshot) && <div className="warning-banner recalc-banner"><IconRefresh size={18} /><strong>受影响港口结论重算中</strong><span>为避免放行旧配载图，重算完成前打印暂不可用；其他港口原有结论继续有效。</span></div>}
     <Card padding="xl" className="print-sheet">
-      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />已校核</div></div>
+      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />{hasPendingConclusion(state.snapshot) ? '重算中' : '已校核'}</div></div>
       <div className="print-kpis"><div><span>总货重</span><strong>{stability.total.toFixed(1)} t</strong></div><div><span>稳性裕度</span><strong>{stability.stability.toFixed(1)}%</strong></div><div><span>纵倾</span><strong>{stability.trim}</strong></div><div><span>主甲板载荷</span><strong>{stability.deckLoad.toFixed(1)} t</strong></div></div>
       <h3>主甲板配载图</h3>
       <div className="print-deck">{Array.from({ length: 28 }).map((_, index) => { const row = index % 4; const bay = 4 + Math.floor(index / 4); const item = state.cargo.find((cargo) => cargo.deck === '主甲板' && cargo.bay === bay && cargo.row === row); return <div key={index} className={item ? 'filled' : ''} style={item ? { borderTopColor: item.color } : undefined}><span>{item ? item.bill.slice(-3) : ''}</span><small>{item ? `${item.weight}t` : `B${bay}/R${row}`}</small>{item?.hazmat !== '无' && item && <b>DG</b>}</div>; })}</div>
@@ -315,7 +364,7 @@ function Shell({ children }: { children: ReactNode }) {
   return <AppShell header={{ height: 62 }} navbar={{ width: 224, breakpoint: 'sm' }} padding={0}>
     <AppShellHeader className="app-header"><Group h="100%" px="md" justify="space-between"><Group gap="sm"><ThemeIcon color="teal" variant="light"><IconShip size={19} /></ThemeIcon><div className="brand-copy"><strong>船舶配载校核台</strong><span>Stowage & Voyage Review</span></div></Group><Group gap="sm" visibleFrom="sm"><Badge variant="light" color="teal">海岳轮</Badge><Text size="xs" c="dimmed">V-2609-17 · 方案 V{state.planRevision}</Text><Badge color={state.locked ? 'teal' : 'orange'}>{state.locked ? '已锁定' : '审阅中'}</Badge></Group><ActionIcon variant="subtle" color="gray"><IconAnchor size={18} /></ActionIcon></Group></AppShellHeader>
     <AppShellNavbar p="xs" className="app-nav"><div className="voyage-card"><Text size="xs" c="dimmed">当前航次</Text><Text fw={800}>上海 → 温哥华</Text><Text size="xs" c="dimmed">经停釜山 · 10-02 离港</Text><Progress value={stability.stability} color={stability.stability > 70 ? 'teal' : 'orange'} size="sm" mt="sm" /><Text size="xs" mt={4}>稳性裕度 {stability.stability.toFixed(1)}%</Text></div>{nav.map((item) => <NavLink end={item.path === '/'} key={item.path} to={item.path}>{item.icon}<span>{item.label}</span></NavLink>)}<div className="nav-foot"><IconRoute size={16} /><Text size="xs">基线：方案 V4<br />草稿：{state.draftSavedAt} 自动保存</Text></div></AppShellNavbar>
-    <AppShellMain>{children}</AppShellMain>
+    <AppShellMain><SyncBanner />{children}</AppShellMain>
   </AppShell>;
 }
 
